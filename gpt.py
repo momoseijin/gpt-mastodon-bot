@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 from mastodon import Mastodon, StreamListener
 import sqlite3
 from contextlib import closing
@@ -8,48 +9,45 @@ from concurrent.futures import ThreadPoolExecutor
 import schedule
 import datetime
 import time
+import string_util
+from context_splitter import split_context
+
+# 返答の1ポストあたりの最大の文字数
+max_chars = 450
+
+# ポスティング間隔 (s)
+wait_to_next_post = 5
 
 # 1日の上限の文字数
-str_limit = 1000
+str_limit = 100000
+
+# 会話履歴の最大数
+# gpt-3.5のコンテキスト上限は 4096 tokens
+# 日本語は 1字 1 token 扱いなので、お互い500字で話し合った場合、4往復を超えたあたりで上限に達し InvalidRequestError になる
+prompts_limit = 8
+
+# 公開範囲
+post_visibility = "unlisted"
+
+# リモートユーザーとの会話を許可する
+allow_remote = False
+
 # 初期プロンプト
-init_prompt = "System: Instructions for GPTちゃん: You're a regular Mastodon user. "
-init_prompt += "You talk casually, use emojis, and don't use capital letters. "
-init_prompt += "You talk in internet shorthand like np and lol and idk and nvm. "
-init_prompt += "You have many interests and love talking to people.\n"
-init_prompt += "<|endoftext|>System: Example conversations:\n"
-init_prompt += "<|endoftext|>bob: how's it going today?\n"
-init_prompt += "<|endoftext|>GPTちゃん: its going great, im watching youtube videos, hbu?\n"
-init_prompt += "<|endoftext|>bob: I'm doing great too!\n"
-init_prompt += "<|endoftext|>GPTちゃん: cool cool\n"
-init_prompt += "<|endoftext|>bob: what's your favorite game?\n"
-init_prompt += "<|endoftext|>GPTちゃん: im been playing a lot of the new pokemon game :D\n"
-init_prompt += "<|endoftext|>bob: me too!\n"
-init_prompt += "<|endoftext|>bob: have you been to the zoo?\n"
-init_prompt += "<|endoftext|>GPTちゃん: i have! unfortunately it started raining so I left early\n"
-init_prompt += "<|endoftext|>bob: that sucks, I hope you get to go again soon\n"
-init_prompt += "<|endoftext|>System: Current conversation:\n"
+init_prompt = [
+    {"role": "system", "content": "You are a helpful assistant and regular Mastodon user."},
+    {"role": "system", "content": "You usually talk in formal Japanese but you are friendly at heart and may also use emojis."},
+    {"role": "system", "content": "You have many interests and love talking to people."}
+]
 
-
-"""
-init_prompt = "<|endoftext|>System: Example conversations:\n"
-init_prompt += "<|endoftext|>あなた: 今日のご機嫌はいかがですか？\n"
-init_prompt += "<|endoftext|>GPTちゃん: とても良いです、私はYouTubeの配信を見ていました、あなたは？\n"
-init_prompt += "<|endoftext|>あなた: とても良いですね、私も配信を見ていました。\n"
-init_prompt += "<|endoftext|>GPTちゃん: いいですね！\n"
-init_prompt += "<|endoftext|>あなた: GPTちゃんの好きなゲームはなんですか？\n"
-init_prompt += "<|endoftext|>GPTちゃん: マインクラフトが好きです！建築は楽しいです。\n"
-init_prompt += "<|endoftext|>あなた: 私もです！\n"
-init_prompt += "<|endoftext|>あなた: 最近動物園には行きましたか？\n"
-init_prompt += "<|endoftext|>GPTちゃん: 行きました！残念ながら雨が降り出してきたので早めに帰りました。\n"
-init_prompt += "<|endoftext|>あなた: それは残念ですね。また行けるといいですね。\n"
-init_prompt += "<|endoftext|>System: Current conversation:\n"
-"""
 load_dotenv()
 
 openai.api_key = os.environ["OPENAI_API_KEY"]
 
 # データベース名
 dbname = "gpt.db"
+
+# Mastodon API
+mastodon = Mastodon(access_token = 'gptchan_clientcred.txt')
 
 def job():
     with closing(sqlite3.connect(dbname)) as conn:
@@ -65,9 +63,9 @@ def db_str_count_reset():
         schedule.run_pending()
         time.sleep(60)
 
-class Stream(StreamListener):
+class GPTMentionListener(StreamListener):
     def __init__(self):
-        super(Stream, self).__init__()
+        super(GPTMentionListener, self).__init__()
 
     def on_notification(self,notif): #通知が来た時に呼び出されます
         if notif['type'] == 'mention': #通知の内容がリプライかチェック
@@ -78,123 +76,228 @@ class Stream(StreamListener):
             st = notif['status']
             main(content, st, id, acct, display_name)
 
-def main(content,st,id,acct, display_name):
+def mastodon_exe():
+    connection_handle = mastodon.stream_user(GPTMentionListener(), run_async=True, timeout=60)
+    print("stream に接続しました")
+    return connection_handle
+
+def connection_handler():
+    connection_handle = mastodon_exe()
+    while True:
+        time.sleep(1)
+        if connection_handle.is_alive() and connection_handle.is_receiving():
+            # stream is healthy
+            continue
+        print("stream に再接続します")
+        try:
+            connection_handle.close()
+        except:
+            pass
+        time.sleep(5)
+        connection_handle = mastodon_exe()
+
+def main(content, st, id, acct, display_name):
+
+    if not allow_remote and id != acct:
+        reply_text = "私はリモートユーザーとの会話は許可されていないのです。申し訳ありません。"
+
+        mastodon.status_reply(st,
+                reply_text,
+                id,
+                visibility=post_visibility)
+        return
+
     global DBFlag
     global keywordMemory
     global dbname
     global keywordAuthor
-    req = content.rsplit(">")[-2].split("<")[0].strip()
+    print(content)
+
+    req = string_util.remove_first_accts_id(string_util.remove_tags(content))
+    print(req)
 
     str_count = -1
-    limit = -1
-    prompt = ""
-    db_prompt = ""
+    prompt = init_prompt.copy()
+    db_prompt = []
 
     with closing(sqlite3.connect(dbname)) as conn:
         c = conn.cursor()
-        create_table = "CREATE TABLE IF NOT EXISTS users(id, acct, str_count, str_limit, prompt ,PRIMARY KEY(acct))"
-        c.execute(create_table)
-        sql = "select str_count, str_limit, prompt from users where acct = ?"
-        word = (acct,)
-        result = c.execute(sql, word)
-        for row in result:
-            if row[0] != "":
-                str_count = row[0]
-                limit = row[1]
-                db_prompt = row[2]
+
+        try:
+            create_count_table = "CREATE TABLE IF NOT EXISTS counts (acct, str_count, PRIMARY KEY(acct))"
+            create_prompt_table = "CREATE TABLE IF NOT EXISTS prompts (seq INTEGER PRIMARY KEY AUTOINCREMENT, acct, role, prompt)"
+            create_prompt_index = "CREATE INDEX IF NOT EXISTS ix_acct ON prompts (acct)"
+            c.execute(create_count_table)
+            c.execute(create_prompt_table)
+            c.execute(create_prompt_index)
+        except Exception as e:
+            print('=== エラー@create_*_table ===')
+            print('type:' + str(type(e)))
+            print('args:' + str(e.args))
+            print('e自身:' + str(e))
+            return
+
+        try:
+            sql_count = "SELECT str_count FROM counts WHERE acct = ?"
+            words_count = (acct,)
+            result_count = c.execute(sql_count, words_count)
+            for row in result_count:
+                if row[0] != "":
+                    str_count = row[0]
+            print(str_count)
+        except Exception as e:
+            print('=== エラー@sql_count ===')
+            print('type:' + str(type(e)))
+            print('args:' + str(e.args))
+            print('e自身:' + str(e))
+            return
 
         if str_count != -1:
             # 1日に会話できる上限を超えていた場合
             # メッセージを表示して処理を終わる
             if len(req) + str_count > limit:
-                reply_text = "お話できる1日の上限を超えました。"
-                reply_text += "日本時間の0時を過ぎるとリセットされるので"
-                reply_text += "また明日試してみてください。"
+                reply_text = "お話できる1日の上限を超えています。"
+                reply_text += "日本時間の0時を過ぎるとリセットされますので"
+                reply_text += "また明日お話ししましょう。"
                 reply_text += "今日はいっぱい話しかけてくれてありがとう！"
 
                 mastodon.status_reply(st,
                         reply_text,
                         id,
-                        visibility='public')
+                        visibility=post_visibility)
                 return
         else:
             # 初回登録
             str_count = 0
-            limit = str_limit
 
-    reply = ""
-    prompt = init_prompt + db_prompt + "<|endoftext|>" + display_name + ": " + req + "\n"
-    prompt = prompt + "<|endoftext|>" + "GPTちゃん: "
+        sql_prompt = "SELECT role, prompt FROM prompts WHERE acct = ?"
+        words_prompt = (acct,)
+        result_prompt = c.execute(sql_prompt, words_prompt)
+        for row in result_prompt:
+            if row[0] != "":
+                db_prompt.append({"role": row[0], "content": row[1]})
+
+    request_message = {"role": "user", "content": req}
+    response_message = {}
+
+    prompt.extend(db_prompt)
+    prompt.append(request_message)
+
+    print(prompt)
     try:
-        response = openai.Completion.create(
-            engine="text-davinci-003",
-            prompt=prompt,
-            temperature=1.0,
-            top_p=0.9,
-            max_tokens=450,
-            stop=["<|endoftext|>"],
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=prompt
         )
-        reply = response.choices[0].text.strip()
+        response_message = response.choices[0].message
+        print(f"{response_message['role']}: {response_message['content']}")
+
     except Exception as e:
         print('=== エラー内容 ===')
         print('type:' + str(type(e)))
         print('args:' + str(e.args))
         print('e自身:' + str(e))
         try:
-            reply = "現在OpenAIのAPIサーバー側で"
+            reply = "現在 OpenAI の API サーバー側で"
             reply += "問題が発生しているようです。"
             reply += "しばらく時間を置いてから"
-            reply += "やり直してほしいです。申し訳ないです。"
+            reply += "あらためて話しかけてください。申し訳ありません。"
             mastodon.status_reply(st,
                     reply,
                     id,
-                    visibility='public')
+                    visibility=post_visibility)
+            return
         except Exception as e:
             print('=== エラー内容 ===')
             print('type:' + str(type(e)))
             print('args:' + str(e.args))
             print('e自身:' + str(e))
+            return
+
+    responses = split_context(string_util.escape_acct_at(response_message.content), max_chars)
 
     try:
-        mastodon.status_reply(st,
-                reply,
-                id,
-                visibility='public')
+        chain_reply(responses, st)
     except Exception as e:
         print('=== エラー内容 ===')
         print('type:' + str(type(e)))
         print('args:' + str(e.args))
         print('e自身:' + str(e))
+        return
 
     with closing(sqlite3.connect(dbname)) as conn:
         c = conn.cursor()
-        sql = "INSERT OR REPLACE INTO users (id, acct, str_count, str_limit, prompt) values (?,?,?,?,?)"
-        str_count = str_count + len(req)
 
-        prompt = db_prompt + "<|endoftext|>" + display_name + ": " + req + "\n"
-        prompt = prompt + "<|endoftext|>" + "GPTちゃん: " + reply + "\n"
-        # promptが500文字以上の場合500文字以下になるまで削る
-        while True:
-            if len(prompt) > 500:
-                prompt_list = prompt.split("\n")
-                del prompt_list[0]
-                prompt = ""
-                for p in prompt_list:
-                    prompt += p + "\n"
-            else:
-                break
+        try:
+            sql_insert_count = "INSERT OR REPLACE INTO counts (acct, str_count) values (?,?)"
+            str_count = str_count + len(req)
+            words_insert_count = (acct, str_count)
+            c.execute(sql_insert_count, words_insert_count)
+            print(f"str_count: {str_count}")
 
-        words = (id , acct, str_count, limit, prompt)
-        c.execute(sql, words)
-        conn.commit()
+            sql_insert_prompt = "INSERT INTO prompts (acct, role, prompt) values (?,?,?)"
+            words_insert_request_prompt = (acct, request_message["role"], request_message["content"])
+            c.execute(sql_insert_prompt, words_insert_request_prompt)
+            words_insert_response_prompt = (acct, response_message["role"], response_message["content"])
+            c.execute(sql_insert_prompt, words_insert_response_prompt)
 
-def mastodon_exe():
-    print("起動しました")
-    mastodon.stream_user(Stream()) #ストリームの起動
+            conn.commit()
+            print("prompts commit done")
 
-mastodon = Mastodon(access_token = 'gptchan_clientcred.txt')
+        except Exception as e:
+            print('=== エラー@prompts commit ===')
+            print('type:' + str(type(e)))
+            print('args:' + str(e.args))
+            print('e自身:' + str(e))
+
+        try:
+            # 会話履歴の上限を超えてたら古いものから削除する
+            sql_rowcount_prompt = "SELECT COUNT(seq) FROM prompts WHERE acct = ?"
+            words_rowcount_prompt = (acct,)
+            c.execute(sql_rowcount_prompt, words_rowcount_prompt)
+            prompts_count = c.fetchone()[0]
+            print(f"prompts_count: {prompts_count}")
+
+            if prompts_count > prompts_limit:
+                print(f"prompts reduce {prompts_count - prompts_limit} rows")
+                sql_reduce_prompt = """DELETE FROM prompts WHERE seq IN (
+                    SELECT seq FROM prompts WHERE acct = ? ORDER BY seq LIMIT ?)"""
+                words_reduce_prompt = (acct, prompts_count - prompts_limit)
+                c.execute(sql_reduce_prompt, words_reduce_prompt)
+                conn.commit()
+                print("prompts reduce done")
+
+        except Exception as e:
+            print('=== エラー@reduce promppts ===')
+            print('type:' + str(type(e)))
+            print('args:' + str(e.args))
+            print('e自身:' + str(e))
+
+def chain_reply(responses, reply_to):
+    recent_status = reply_to
+    for response in responses:
+        recent_status = mastodon.status_reply(
+                    recent_status,
+                    response,
+                    id,
+                    visibility=post_visibility)
+        time.sleep(wait_to_next_post)
+
 
 with ThreadPoolExecutor(max_workers=2, thread_name_prefix="thread") as executor:
     executor.submit(db_str_count_reset)
-    executor.submit(mastodon_exe)
+    executor.submit(connection_handler)
 
+
+
+
+
+
+
+
+
+
+
+
+
+   
