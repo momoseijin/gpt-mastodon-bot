@@ -187,7 +187,7 @@ def main(content, st, id, acct, display_name):
 
     print(prompt)
     try:
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=prompt
         )
