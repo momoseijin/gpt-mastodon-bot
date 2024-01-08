@@ -287,17 +287,3 @@ def chain_reply(responses, reply_to):
 with ThreadPoolExecutor(max_workers=2, thread_name_prefix="thread") as executor:
     executor.submit(db_str_count_reset)
     executor.submit(connection_handler)
-
-
-
-
-
-
-
-
-
-
-
-
-
-   
