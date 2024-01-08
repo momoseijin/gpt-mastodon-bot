@@ -2,7 +2,7 @@
 from mastodon import Mastodon, StreamListener
 import sqlite3
 from contextlib import closing
-import openai
+from openai import OpenAI
 import os
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
@@ -41,7 +41,9 @@ init_prompt = [
 
 load_dotenv()
 
-openai.api_key = os.environ["OPENAI_API_KEY"]
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+)
 
 # データベース名
 dbname = "gpt.db"
