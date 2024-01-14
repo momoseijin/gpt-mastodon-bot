@@ -42,7 +42,7 @@ init_prompt = [
 load_dotenv()
 
 client = OpenAI(
-    api_key=os.environ["OPENAI_API_KEY"],
+    api_key=os.environ.get("OPENAI_API_KEY"),
 )
 
 # データベース名
