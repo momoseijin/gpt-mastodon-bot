@@ -191,7 +191,7 @@ def main(content, st, id, acct, display_name):
             model="gpt-3.5-turbo",
             messages=prompt
         )
-        response_message = response.choices[0].message
+        response_message = response.choices[0].message.content
         print(f"{response_message['role']}: {response_message['content']}")
 
     except Exception as e:
